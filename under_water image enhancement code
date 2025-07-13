@@ -1,0 +1,191 @@
+# --- Mount Google Drive ---
+from google.colab import drive
+drive.mount('/content/drive')
+# --- Imports ---
+import os
+import time
+import random
+import numpy as np
+import torch
+import matplotlib.pyplot as plt
+from torch import nn
+from torch.nn import functional as F
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+import cv2
+from tqdm.notebook import tqdm
+# --- Device Configuration ---
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}"
+# --- Lightweight Encoder ---
+class LightEncoder(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv1 = nn.Conv2d(3, 32, 3, padding=1)
+        self.relu1 = nn.ReLU(inplace=True)
+        self.pool1 = nn.MaxPool2d(2)
+
+        self.conv2 = nn.Conv2d(32, 64, 3, padding=1)
+        self.relu2 = nn.ReLU(inplace=True)
+        self.pool2 = nn.MaxPool2d(2)
+
+        self.conv3 = nn.Conv2d(64, 128, 3, padding=1)
+        self.relu3 = nn.ReLU(inplace=True)
+        self.pool3 = nn.MaxPool2d(2)
+
+        self.conv4 = nn.Conv2d(128, 256, 3, padding=1)
+        self.relu4 = nn.ReLU(inplace=True)
+        self.pool4 = nn.MaxPool2d(2)
+
+    def forward(self, x):
+        features = []
+        x = self.relu1(self.conv1(x)); features.append(x); x = self.pool1(x)
+        x = self.relu2(self.conv2(x)); features.append(x); x = self.pool2(x)
+        x = self.relu3(self.conv3(x)); features.append(x); x = self.pool3(x)
+        x = self.relu4(self.conv4(x)); features.append(x); x = self.pool4(x)
+        return features, x
+
+class LightDecoder(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.up1 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        self.dconv1 = nn.Conv2d(256 + 256, 128, 3, padding=1)  # 256 from upsample, 256 from encoder
+
+        self.up2 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        self.dconv2 = nn.Conv2d(128 + 128, 64, 3, padding=1)   # 128 from upsample, 128 from encoder
+
+        self.up3 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        self.dconv3 = nn.Conv2d(64 + 64, 32, 3, padding=1)     # 64 from upsample, 64 from encoder
+
+        self.up4 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        self.dconv4 = nn.Conv2d(32 + 32, 32, 3, padding=1)     # 32 from upsample, 32 from encoder
+
+        self.conv_final = nn.Conv2d(32, 3, 1)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, features, x):
+        x = self.up1(x); x = torch.cat([x, features[3]], dim=1); x = F.relu(self.dconv1(x))
+        x = self.up2(x); x = torch.cat([x, features[2]], dim=1); x = F.relu(self.dconv2(x))
+        x = self.up3(x); x = torch.cat([x, features[1]], dim=1); x = F.relu(self.dconv3(x))
+        x = self.up4(x); x = torch.cat([x, features[0]], dim=1); x = F.relu(self.dconv4(x))
+        return self.sigmoid(self.conv_final(x))
+# --- Full Model ---
+class LightUnderwaterEnhancer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.encoder = LightEncoder()
+        self.decoder = LightDecoder()
+
+    def forward(self, x):
+        features, bottleneck = self.encoder(x)
+        return self.decoder(features, bottleneck)
+# --- Dataset Class ---
+class UnderwaterImageDataset(Dataset):
+    def __init__(self, raw_dir, reference_dir, input_size=(256, 256), training=True, split_ratio=0.8):
+        self.raw_dir = raw_dir
+        self.reference_dir = reference_dir
+        self.training = training
+        self.input_size = input_size
+        self.preprocess = transforms.ToTensor()
+
+        self.files = sorted([f for f in os.listdir(raw_dir) if f.lower().endswith(('jpg', 'jpeg', 'png'))])
+        split = int(len(self.files) * split_ratio)
+        self.files = self.files[:split] if training else self.files[split:]
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, idx):
+        filename = self.files[idx]
+        raw_img = cv2.imread(os.path.join(self.raw_dir, filename))
+        ref_img = cv2.imread(os.path.join(self.reference_dir, filename))
+
+        raw_img = cv2.resize(cv2.cvtColor(raw_img, cv2.COLOR_BGR2RGB), self.input_size)
+        ref_img = cv2.resize(cv2.cvtColor(ref_img, cv2.COLOR_BGR2RGB), self.input_size)
+
+        return self.preprocess(raw_img), self.preprocess(ref_img)
+# --- Visualize Samples ---
+def visualize_samples(dataset, num=3):
+    for i in range(num):
+        raw, ref = dataset[random.randint(0, len(dataset) - 1)]
+        fig, axs = plt.subplots(1, 2, figsize=(8, 4))
+        axs[0].imshow(raw.permute(1, 2, 0)); axs[0].set_title("Raw"); axs[0].axis('off')
+        axs[1].imshow(ref.permute(1, 2, 0)); axs[1].set_title("Reference"); axs[1].axis('off')
+        plt.show()
+# --- Training Function ---
+def train_model(model, train_loader, val_loader, epochs=10, lr=0.001):
+    model.to(device)
+    criterion = nn.MSELoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=2, verbose=True)
+    best_val = float('inf')
+    for epoch in range(1, epochs + 1):
+        model.train()
+        train_loss = 0
+        for raw, ref in tqdm(train_loader, desc=f"Epoch {epoch}/{epochs}"):
+            raw, ref = raw.to(device), ref.to(device)
+            out = model(raw)
+            loss = criterion(out, ref)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item()
+        # Validation
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for raw, ref in val_loader:
+                raw, ref = raw.to(device), ref.to(device)
+                val_loss += criterion(model(raw), ref).item()
+        train_loss /= len(train_loader)
+        val_loss /= len(val_loader)
+        scheduler.step(val_loss)
+        print(f"Epoch {epoch}: Train Loss = {train_loss:.4f} | Val Loss = {val_loss:.4f}")
+        if val_loss < best_val:
+            best_val = val_loss
+            path = "/content/drive/MyDrive/underwater_enhancement_model.pth"
+            torch.save(model.cpu().state_dict(), path)
+            model.to(device)
+            print("✅ Saved best model!")
+# --- Testing Function ---
+def test_model(model, val_loader, num_samples=5):
+    model.eval()
+    model.to(device)
+    data = next(iter(val_loader))
+    raw, ref = data
+    raw = raw.to(device)
+    with torch.no_grad():
+        pred = model(raw)
+    for i in range(num_samples):
+        fig, axs = plt.subplots(1, 3, figsize=(12, 4))
+        axs[0].imshow(raw[i].cpu().permute(1, 2, 0)); axs[0].set_title("Raw"); axs[0].axis('off')
+        axs[1].imshow(pred[i].cpu().permute(1, 2, 0)); axs[1].set_title("Enhanced"); axs[1].axis('off')
+        axs[2].imshow(ref[i].permute(1, 2, 0)); axs[2].set_title("Reference"); axs[2].axis('off')
+        plt.show()
+# --- Main ---
+def main():
+    raw_folder = "/content/drive/My Drive/raw"
+    reference_folder = "/content/drive/My Drive/reference"
+
+    train_ds = UnderwaterImageDataset(raw_folder, reference_folder, training=True)
+    val_ds = UnderwaterImageDataset(raw_folder, reference_folder, training=False)
+
+    print(f"Train samples: {len(train_ds)}, Val samples: {len(val_ds)}")
+    visualize_samples(train_ds)
+
+    train_loader = DataLoader(train_ds, batch_size=8, shuffle=True, num_workers=2)
+    val_loader = DataLoader(val_ds, batch_size=8, shuffle=False, num_workers=2)
+
+    model = LightUnderwaterEnhancer()
+    train_model(model, train_loader, val_loader, epochs=12, lr=0.001)
+    test_model(model, val_loader)
+main()
+# Save TorchScript model
+model = LightUnderwaterEnhancer()
+model.load_state_dict(torch.load("/content/drive/MyDrive/underwater_enhancement_model.pth", map_location='cpu'))
+model.eval()
+example_input = torch.rand(1, 3, 256, 256)
+traced_model = torch.jit.trace(model, example_input)
+torchscript_path = "/content/drive/MyDrive/light_underwater_enhancer_script.pt"
+traced_model.save(torchscript_path)
+print(f"✅ TorchScript model saved at: {torchscript_path}")
